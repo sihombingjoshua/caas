@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  caas-api:
+    # Build the Docker image from the Dockerfile in the current directory.
+    build: .
+    # Map port 5001 on your host machine to port 5001 in the container.
+    ports:
+      - "5001:5001"
+    # Mount the 'caas-data' volume to the '/data' directory inside the container.
+    # This is where our keystore.json will be saved.
+    volumes:
+      - caas-data:/data
+    # Give the container a friendly name.
+    container_name: my-caas-app
+
+# Define the named volume for persistent storage.
+volumes:
+  caas-data:
