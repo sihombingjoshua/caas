@@ -12,7 +12,7 @@ app = Flask(__name__)
 # --- Persistent Data Storage ---
 # We will now use a file inside a volume to store our data.
 # The path /data/ will be our mount point from Docker Compose.
-KEYSTORE_FILE = '/data/keystore.json'
+KEYSTORE_FILE = './keystore.json'
 
 # Global variables to hold the data in memory during runtime.
 TENANTS = {}
@@ -258,6 +258,5 @@ def verify_signature(tenant_id):
 
 # --- Main Execution ---
 if __name__ == '__main__':
-    os.makedirs('/data', exist_ok=True) # Ensure the /data directory exists
     load_keystore() # Load existing data on startup
     app.run(host='0.0.0.0', port=5001, debug=True) # Listen on 0.0.0.0 to be accessible from outside the container
