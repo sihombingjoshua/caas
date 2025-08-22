@@ -45,38 +45,44 @@ def save_keystore():
         json.dump(state, f)
 
 def load_keystore():
-    """Loads the state from the JSON file into memory when the app starts."""
+    """Loads the state from the JSON file, correctly assigning tenant ownership."""
     global TENANTS, API_KEYS, SYMMETRIC_KEYS, ASYMMETRIC_KEYS
     try:
-        with open(KEYSTORE_FILE, 'r') as f:
-            state = json.load(f)
-            TENANTS = state.get('tenants', {})
-            API_KEYS = state.get('api_keys', {})
-            
-            # Recreate Fernet objects from stored key bytes
-            symm_keys_hex = state.get('symmetric_keys_hex', {})
-            for key_id, key_hex in symm_keys_hex.items():
-                key_bytes = bytes.fromhex(key_hex)
-                SYMMETRIC_KEYS[key_id] = {
-                    'key_material': Fernet(key_bytes),
-                    'key_material_bytes': key_bytes, # Store bytes for resaving
-                    'tenant_id': TENANTS[API_KEYS[list(API_KEYS.keys())[0]]]['name'] # simplified tenant mapping
-                }
+        if os.path.exists(KEYSTORE_FILE) and os.path.getsize(KEYSTORE_FILE) > 0:
+            with open(KEYSTORE_FILE, 'r') as f:
+                state = json.load(f)
+                TENANTS = state.get('tenants', {})
+                API_KEYS = state.get('api_keys', {})
+                
+                symm_keys_hex = state.get('symmetric_keys_hex', {})
+                for key_id, key_hex in symm_keys_hex.items():
+                    key_bytes = bytes.fromhex(key_hex)
+                    # --- FIXED LOGIC HERE ---
+                    # Get the tenant_id by splitting the key_id string
+                    owner_tenant_id = key_id.split('_')[0] + '_' + key_id.split('_')[1]
+                    SYMMETRIC_KEYS[key_id] = {
+                        'key_material': Fernet(key_bytes),
+                        'key_material_bytes': key_bytes,
+                        'tenant_id': owner_tenant_id # Assign correct owner
+                    }
 
-            # Recreate RSA objects from stored PEM data
-            asymm_keys_pem_hex = state.get('asymmetric_keys_pem_hex', {})
-            for key_id, pem_hex in asymm_keys_pem_hex.items():
-                 priv_pem_bytes = bytes.fromhex(pem_hex)
-                 private_key = serialization.load_pem_private_key(priv_pem_bytes, password=None)
-                 ASYMMETRIC_KEYS[key_id] = {
-                    'private_key': private_key,
-                    'public_key': private_key.public_key(),
-                    'tenant_id': TENANTS[API_KEYS[list(API_KEYS.keys())[0]]]['name']
-                 }
+                asymm_keys_pem_hex = state.get('asymmetric_keys_pem_hex', {})
+                for key_id, pem_hex in asymm_keys_pem_hex.items():
+                     priv_pem_bytes = bytes.fromhex(pem_hex)
+                     private_key = serialization.load_pem_private_key(priv_pem_bytes, password=None)
+                     # --- FIXED LOGIC HERE ---
+                     # Get the tenant_id by splitting the key_id string
+                     owner_tenant_id = key_id.split('_')[0] + '_' + key_id.split('_')[1]
+                     ASYMMETRIC_KEYS[key_id] = {
+                        'private_key': private_key,
+                        'public_key': private_key.public_key(),
+                        'tenant_id': owner_tenant_id # Assign correct owner
+                     }
+        else:
+            TENANTS, API_KEYS, SYMMETRIC_KEYS, ASYMMETRIC_KEYS = {}, {}, {}, {}
 
     except FileNotFoundError:
-        # If the file doesn't exist, start with empty stores.
-        pass
+        TENANTS, API_KEYS, SYMMETRIC_KEYS, ASYMMETRIC_KEYS = {}, {}, {}, {}
 
 # --- Authentication ---
 def require_api_key(f):
@@ -157,6 +163,98 @@ def encrypt_data(tenant_id):
         "key_id": key_id,
         "ciphertext": ciphertext.decode('utf-8')
     })
+
+@app.route('/decrypt', methods=['POST'])
+@require_api_key
+def decrypt_data(tenant_id):
+    """
+    Decrypts ciphertext using a specified symmetric key.
+    """
+    data = request.get_json()
+    key_id = data.get('key_id')
+    ciphertext = data.get('ciphertext')
+
+    if not key_id or not ciphertext:
+        return jsonify({"error": "key_id and ciphertext are required."}), 400
+
+    key_info = SYMMETRIC_KEYS.get(key_id)
+    if not key_info or key_info['tenant_id'] != tenant_id:
+        return jsonify({"error": "Key not found or access denied."}), 404
+
+    try:
+        ciphertext_bytes = ciphertext.encode('utf-8')
+        plaintext = key_info['key_material'].decrypt(ciphertext_bytes)
+        return jsonify({
+            "key_id": key_id,
+            "plaintext": plaintext.decode('utf-8')
+        })
+    except Exception as e:
+        return jsonify({"error": "Decryption failed. Ciphertext may be invalid or corrupt."}), 400
+
+@app.route('/sign', methods=['POST'])
+@require_api_key
+def sign_data(tenant_id):
+    """
+    Signs a piece of data (or its hash) with a specified private key.
+    """
+    data = request.get_json()
+    key_id = data.get('key_id')
+    message = data.get('message')
+
+    if not key_id or not message:
+        return jsonify({"error": "key_id and message are required."}), 400
+
+    key_info = ASYMMETRIC_KEYS.get(key_id)
+    if not key_info or key_info['tenant_id'] != tenant_id:
+        return jsonify({"error": "Key not found or access denied."}), 404
+
+    signature = key_info['private_key'].sign(
+        message.encode('utf-8'),
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.MAX_LENGTH
+        ),
+        hashes.SHA256()
+    )
+
+    return jsonify({
+        "key_id": key_id,
+        "signature": signature.hex() # Return signature as hex for easy transport
+    })
+
+@app.route('/verify', methods=['POST'])
+@require_api_key
+def verify_signature(tenant_id):
+    """
+    Verifies a signature against the original message and a public key.
+    """
+    data = request.get_json()
+    key_id = data.get('key_id')
+    message = data.get('message')
+    signature_hex = data.get('signature')
+
+    if not all([key_id, message, signature_hex]):
+        return jsonify({"error": "key_id, message, and signature are required."}), 400
+
+    key_info = ASYMMETRIC_KEYS.get(key_id)
+    if not key_info or key_info['tenant_id'] != tenant_id:
+        return jsonify({"error": "Key not found or access denied."}), 404
+    
+    try:
+        signature = bytes.fromhex(signature_hex)
+        key_info['public_key'].verify(
+            signature,
+            message.encode('utf-8'),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        return jsonify({"status": "verified", "valid": True})
+    except Exception:
+        return jsonify({"status": "failed", "valid": False})
+
 
 # --- Main Execution ---
 if __name__ == '__main__':
